@@ -135,6 +135,7 @@ func (pge *PgEngine) GetChainParamValues(ctx context.Context, paramValues *[]str
 
 type executor interface {
 	Exec(ctx context.Context, sql string, arguments ...interface{}) (commandTag pgconn.CommandTag, err error)
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 // ExecuteSQLTask executes SQL task
@@ -143,6 +144,7 @@ func (pge *PgEngine) ExecuteSQLTask(ctx context.Context, tx pgx.Tx, task *ChainT
 	var remoteDb PgxConnIface
 	var executor executor
 
+	l := log.GetLogger(ctx)
 	execTx = tx
 	if task.Autonomous {
 		executor = pge.ConfigDb
@@ -152,27 +154,25 @@ func (pge *PgEngine) ExecuteSQLTask(ctx context.Context, tx pgx.Tx, task *ChainT
 
 	//Connect to Remote DB
 	if task.ConnectString.Valid {
-		remoteDb, execTx, err = pge.GetRemoteDBTransaction(ctx, task.ConnectString.String)
+		remoteDb, err = pge.GetRemoteDBConnection(ctx, task.ConnectString.String)
 		if err != nil {
 			return
 		}
-		if task.Autonomous {
-			executor = remoteDb
-			_ = execTx.Rollback(ctx)
-		} else {
-			executor = execTx
+		executor = remoteDb
+		if !task.Autonomous {
+			execTx, err = remoteDb.Begin(ctx)
+			if err != nil {
+				l.WithError(err).Error("Failed to start remote transaction")
+			}
 		}
-
 		defer pge.FinalizeRemoteDBConnection(ctx, remoteDb)
 	}
 
-	if !task.Autonomous {
-		pge.SetRole(ctx, execTx, task.RunAs)
-		if task.IgnoreError {
-			pge.MustSavepoint(ctx, execTx, fmt.Sprintf("task_%d", task.TaskID))
-		}
+	if !task.Autonomous && task.IgnoreError {
+		pge.MustSavepoint(ctx, execTx, fmt.Sprintf("task_%d", task.TaskID))
 	}
 
+	pge.SetRole(ctx, executor, task.RunAs)
 	pge.SetCurrentTaskContext(ctx, executor, task.TaskID)
 	out, err = pge.ExecuteSQLCommand(ctx, executor, task.Script, paramValues)
 
@@ -181,8 +181,8 @@ func (pge *PgEngine) ExecuteSQLTask(ctx context.Context, tx pgx.Tx, task *ChainT
 	}
 
 	//Reset The Role
-	if task.RunAs.Valid && !task.Autonomous {
-		pge.ResetRole(ctx, execTx)
+	if task.RunAs.Valid {
+		pge.ResetRole(ctx, executor)
 	}
 
 	// Commit changes on remote server
@@ -218,14 +218,14 @@ func (pge *PgEngine) ExecuteSQLCommand(ctx context.Context, executor executor, c
 	return
 }
 
-// GetRemoteDBTransaction create a remote db connection and returns transaction object
-func (pge *PgEngine) GetRemoteDBTransaction(ctx context.Context, connectionString string) (PgxConnIface, pgx.Tx, error) {
+// GetRemoteDBConnection create a remote db connection and returns transaction object
+func (pge *PgEngine) GetRemoteDBConnection(ctx context.Context, connectionString string) (PgxConnIface, error) {
 	if strings.TrimSpace(connectionString) == "" {
-		return nil, nil, errors.New("Connection string is blank")
+		return nil, errors.New("Connection string is blank")
 	}
 	connConfig, err := pgx.ParseConfig(connectionString)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	// connConfig.Logger = log.NewPgxLogger(pge.l)
 	// if pge.Verbose() {
@@ -237,15 +237,11 @@ func (pge *PgEngine) GetRemoteDBTransaction(ctx context.Context, connectionStrin
 	remoteDb, err := pgx.ConnectConfig(ctx, connConfig)
 	if err != nil {
 		l.WithError(err).Error("Failed to establish remote connection")
-		return nil, nil, err
+		return nil, err
 	}
 	l.Info("Remote connection established...")
-	remoteTx, err := remoteDb.Begin(ctx)
-	if err != nil {
-		l.WithError(err).Error("Failed to start remote transaction")
-		return nil, nil, err
-	}
-	return remoteDb, remoteTx, nil
+
+	return remoteDb, nil
 }
 
 // FinalizeRemoteDBConnection closes session
@@ -259,24 +255,24 @@ func (pge *PgEngine) FinalizeRemoteDBConnection(ctx context.Context, remoteDb Pg
 }
 
 // SetRole - set the current user identifier of the current session
-func (pge *PgEngine) SetRole(ctx context.Context, tx pgx.Tx, runUID pgtype.Text) {
+func (pge *PgEngine) SetRole(ctx context.Context, executor executor, runUID pgtype.Text) {
 	if !runUID.Valid {
 		return
 	}
 	l := log.GetLogger(ctx)
 	l.Info("Setting Role to ", runUID.String)
-	_, err := tx.Exec(ctx, fmt.Sprintf("SET ROLE %v", runUID.String))
+	_, err := executor.Exec(ctx, fmt.Sprintf("SET ROLE %v", runUID.String))
 	if err != nil {
 		l.WithError(err).Error("Error in Setting role", err)
 	}
 }
 
 // ResetRole - RESET forms reset the current user identifier to be the current session user identifier
-func (pge *PgEngine) ResetRole(ctx context.Context, tx pgx.Tx) {
+func (pge *PgEngine) ResetRole(ctx context.Context, executor executor) {
 	l := log.GetLogger(ctx)
 	l.Info("Resetting Role")
 	const sqlResetRole = `RESET ROLE`
-	_, err := tx.Exec(ctx, sqlResetRole)
+	_, err := executor.Exec(ctx, sqlResetRole)
 	if err != nil {
 		l.WithError(err).Error("Failed to set a role", err)
 	}

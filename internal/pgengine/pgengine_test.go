@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	pgx "github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,11 +50,11 @@ func SetupTestCase(t *testing.T) func(t *testing.T) {
 }
 
 // setupTestRenoteDBFunc used to connect to remote postgreSQL database
-var setupTestRemoteDBFunc = func() (pgengine.PgxConnIface, pgx.Tx, error) {
+var setupTestRemoteDBFunc = func() (pgengine.PgxConnIface, error) {
 	c := cmdOpts.Connection
 	connstr := fmt.Sprintf("host='%s' port='%d' sslmode='%s' dbname='%s' user='%s' password='%s'",
 		c.Host, c.Port, c.SSLMode, c.DBName, c.User, c.Password)
-	return pge.GetRemoteDBTransaction(context.Background(), connstr)
+	return pge.GetRemoteDBConnection(context.Background(), connstr)
 }
 
 func TestInitAndTestConfigDBConnection(t *testing.T) {
@@ -194,7 +193,9 @@ func TestGetRemoteDBTransaction(t *testing.T) {
 
 	ctx := context.Background()
 
-	remoteDb, tx, err := setupTestRemoteDBFunc()
+	remoteDb, err := setupTestRemoteDBFunc()
+	tx, err := remoteDb.Begin(ctx)
+
 	defer pge.FinalizeRemoteDBConnection(ctx, remoteDb)
 	require.NoError(t, err, "remoteDB should be initialized")
 	require.NotNil(t, remoteDb, "remoteDB should be initialized")
